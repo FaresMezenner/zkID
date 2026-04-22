@@ -1,0 +1,280 @@
+use ark_bn254::{Fr, G1Projective};
+use ark_ec::AdditiveGroup;
+use ark_ff::BigInteger;
+use ark_ff::Field;
+use ark_ff::PrimeField;
+use ark_serialize::CanonicalSerialize;
+use ark_std::UniformRand;
+use rand::Rng;
+
+use crate::core::fr_to_bytes;
+use crate::core::point_to_bytes;
+use crate::core::{
+    commit, commit_fr, compute_secondary_diagonals, fiat_shamir_challenge, fold_points,
+    fold_values, inner_product_fr, powers_vec, to_bits_le,
+};
+use crate::data::{
+    BulletproofProverPublicValues, ProverPrivateValues, ProverPublicValues, PublicValues,
+    UserPrivateDetails,
+};
+use crate::prover;
+
+pub fn random_linear_terms<R: Rng>(n_bits: &u128, rng: &mut R) -> Vec<Fr> {
+    let mut terms: Vec<Fr> = Vec::new();
+    for _ in 0..*n_bits {
+        terms.push(Fr::rand(rng));
+    }
+    terms
+}
+
+pub fn calculate_a_s_v(
+    value: u128,
+    public_values: &PublicValues,
+    prover_private_values: &mut ProverPrivateValues,
+    n_bits: u128,
+) -> (G1Projective, G1Projective, G1Projective) {
+    let mut rng = rand::thread_rng();
+    let aL = to_bits_le(value, n_bits);
+    let aR: Vec<i128> = aL.iter().map(|bit| (*bit as i128) - 1).collect();
+    let sL: Vec<Fr> = random_linear_terms(&n_bits, &mut rng);
+    let sR: Vec<Fr> = random_linear_terms(&n_bits, &mut rng);
+
+    prover_private_values.age_verification_proof.alpha = Some(Fr::rand(&mut rng));
+    prover_private_values.age_verification_proof.beta = Some(Fr::rand(&mut rng));
+
+    let A = commit(&aR, &public_values.H_vec).unwrap()
+        + commit(&aL, &public_values.G_vec).unwrap()
+        + public_values.B * prover_private_values.age_verification_proof.alpha.unwrap();
+
+    let S = commit_fr(&sR, &public_values.H_vec).unwrap()
+        + commit_fr(&sL, &public_values.G_vec).unwrap()
+        + public_values.B * prover_private_values.age_verification_proof.beta.unwrap();
+
+    let V = public_values.G * Fr::from(value as i128)
+        + public_values.B * prover_private_values.age_verification_proof.gamma.unwrap();
+
+    prover_private_values.age_verification_proof.aL =
+        Some(aL.iter().map(|v| Fr::from(*v)).collect());
+    prover_private_values.age_verification_proof.aR =
+        Some(aR.iter().map(|v| Fr::from(*v)).collect());
+    prover_private_values.age_verification_proof.sL = Some(sL);
+    prover_private_values.age_verification_proof.sR = Some(sR);
+    (A, S, V)
+}
+
+pub fn logarithmic_inner_product_prover_values(
+    Ls: &mut Vec<G1Projective>,
+    Rs: &mut Vec<G1Projective>,
+    a: &mut Vec<Fr>,
+    b: &mut Vec<Fr>,
+    G_vec: &mut Vec<G1Projective>,
+    H_vec: &mut Vec<G1Projective>,
+    Q: &G1Projective,
+) -> (Fr, Fr) {
+    if a.len() == 1 {
+        assert!(
+            a.len() == 1 && b.len() == 1 && G_vec.len() == 1 && H_vec.len() == 1,
+            "A problem occured while calculating the bulletproof prover vlaues"
+        );
+        return (a[0], b[0]);
+    }
+
+    let mut b_Q = b.iter().map(|b_value| *Q * (*b_value)).collect();
+    let (L_a, R_a) = compute_secondary_diagonals(G_vec, a);
+    let (L_b, R_b) = compute_secondary_diagonals(H_vec, b);
+    let (L_ab, R_ab) = compute_secondary_diagonals(&mut b_Q, a);
+
+    Ls.push(L_a + R_b + L_ab);
+    Rs.push(R_a + L_b + R_ab);
+
+    // u is computed using fiat-shamir over L and R of this round
+    let L = Ls.last().unwrap();
+    let R = Rs.last().unwrap();
+    let u = fiat_shamir_challenge(&[&point_to_bytes(L), &point_to_bytes(R)]);
+
+    // here we calculate the values of the next iteration
+    let mut a_prime = fold_values(a, u);
+    let mut b_prime = fold_values(b, u.inverse().unwrap());
+    let mut G_vec_prime = fold_points(G_vec, u.inverse().unwrap());
+    let mut H_vec_prime = fold_points(H_vec, u);
+    logarithmic_inner_product_prover_values(
+        Ls,
+        Rs,
+        &mut a_prime,
+        &mut b_prime,
+        &mut G_vec_prime,
+        &mut H_vec_prime,
+        Q,
+    )
+}
+
+pub fn calculate_proofs_values(
+    age_threshold: u128,
+    public_values: &PublicValues,
+    prover_private_values: &mut ProverPrivateValues,
+    n_bits: u128,
+    current_timestamp: u128,
+    user_private_details: &mut UserPrivateDetails,
+) -> BulletproofProverPublicValues {
+    let mut rng = rand::thread_rng();
+    let v_age: u128 = age_threshold + ((1u128 << n_bits) - 1) - current_timestamp
+        + (user_private_details.birthday.timestamp_millis() as u128);
+
+    let (A_age, S_age, V_age_prover) =
+        prover::calculate_a_s_v(v_age, &public_values, prover_private_values, n_bits);
+
+    // here we calculate y and z using fiat shammir
+    let y = fiat_shamir_challenge(&[&point_to_bytes(&A_age), &point_to_bytes(&S_age)]);
+    let z = fiat_shamir_challenge(&[
+        &point_to_bytes(&A_age),
+        &point_to_bytes(&S_age),
+        &fr_to_bytes(&y),
+    ]);
+
+    let y_n = powers_vec(&y, &n_bits);
+
+    // now we calcuate the polynomials terms
+    let l_const: Vec<Fr> = prover_private_values
+        .age_verification_proof
+        .aL
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|v| *v - z)
+        .collect();
+    let r_const: Vec<Fr> = prover_private_values
+        .age_verification_proof
+        .aR
+        .as_ref()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (*v + z) * y_n[i] + z * z * Fr::from(1u128 << i))
+        .collect();
+
+    let y_n_sR: Vec<Fr> = prover_private_values
+        .age_verification_proof
+        .sR
+        .as_ref()
+        .unwrap()
+        .iter()
+        .zip(y_n)
+        .map(|(s_r, y_n)| (*s_r) * (y_n))
+        .collect();
+
+    let t_0 = inner_product_fr(&l_const, &r_const);
+    let t_1 = inner_product_fr(&l_const, &y_n_sR)
+        + inner_product_fr(
+            &r_const,
+            prover_private_values
+                .age_verification_proof
+                .sL
+                .as_ref()
+                .unwrap(),
+        );
+    let t_2 = inner_product_fr(
+        prover_private_values
+            .age_verification_proof
+            .sL
+            .as_ref()
+            .unwrap(),
+        &y_n_sR,
+    );
+    prover_private_values.age_verification_proof.t_0 = Some(t_0);
+    prover_private_values.age_verification_proof.t_1 = Some(t_1);
+    prover_private_values.age_verification_proof.t_2 = Some(t_2);
+
+    let tau_1 = Fr::rand(&mut rng);
+    let tau_2 = Fr::rand(&mut rng);
+    let T_1 = public_values.G * t_1 + public_values.B * tau_1;
+    let T_2 = public_values.G * t_2 + public_values.B * tau_2;
+
+    // u is computed using fiat-shamir over the transcript so far
+    let u = fiat_shamir_challenge(&[
+        &point_to_bytes(&A_age),
+        &point_to_bytes(&S_age),
+        &fr_to_bytes(&y),
+        &fr_to_bytes(&z),
+        &point_to_bytes(&T_1),
+        &point_to_bytes(&T_2),
+    ]);
+    let mut l_u: Vec<Fr> = l_const
+        .iter()
+        .zip(
+            prover_private_values
+                .age_verification_proof
+                .sL
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|s_l| (*s_l) * u)
+                .collect::<Vec<Fr>>(),
+        )
+        .map(|(l, s_l_u)| *l + s_l_u)
+        .collect();
+    let mut r_u: Vec<Fr> = r_const
+        .iter()
+        .zip(y_n_sR.iter())
+        .map(|(r, y_n_s_r)| *r + *y_n_s_r * u)
+        .collect();
+
+    let C: ark_ec::short_weierstrass::Projective<ark_bn254::g1::Config> =
+        commit_fr(&l_u, &public_values.G_vec).unwrap()
+            + commit_fr(&r_u, &public_values.H_vec).unwrap();
+
+    let t_u = t_0 + t_1 * u + t_2 * u * u;
+    let pi_l_r = prover_private_values.age_verification_proof.alpha.unwrap()
+        + prover_private_values.age_verification_proof.beta.unwrap() * u;
+    let pi_t = z * z * prover_private_values.age_verification_proof.gamma.unwrap()
+        + tau_1 * u
+        + tau_2 * u * u;
+
+    let mut Ls: Vec<G1Projective> = Vec::new();
+    let mut Rs: Vec<G1Projective> = Vec::new();
+    let (a, b) = logarithmic_inner_product_prover_values(
+        &mut Ls,
+        &mut Rs,
+        &mut l_u,
+        &mut r_u,
+        &mut public_values.G_vec.clone(),
+        &mut public_values.H_vec.clone(),
+        &public_values.Q,
+    );
+    BulletproofProverPublicValues {
+        A: A_age,
+        C: C,
+        S: S_age,
+        Ls: Ls,
+        Rs: Rs,
+        T_1: T_1,
+        T_2: T_2,
+        V: V_age_prover,
+        l_u: l_u,
+        pi_l_r: pi_l_r,
+        pi_t: pi_t,
+        r_u: r_u,
+        t_u: t_u,
+        a: a,
+        b: b,
+    }
+}
+
+pub fn calculate_values(
+    age_threshold: u128,
+    public_values: &PublicValues,
+    prover_private_values: &mut ProverPrivateValues,
+    n_bits: u128,
+    current_timestamp: u128,
+    user_private_details: &mut UserPrivateDetails,
+) -> ProverPublicValues {
+    ProverPublicValues {
+        age_verification_proof: calculate_proofs_values(
+            age_threshold,
+            public_values,
+            prover_private_values,
+            n_bits,
+            current_timestamp,
+            user_private_details,
+        ),
+    }
+}
