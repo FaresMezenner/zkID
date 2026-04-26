@@ -1,7 +1,10 @@
-use ark_bn254::{Fr, G1Projective};
+use ark_bn254::{Bn254, Fr, G1Projective, G2Projective};
+use ark_ec::pairing::PairingOutput;
+use ark_ff::UniformRand;
 use ark_serialize::CanonicalSerialize;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use elliptic_curve::rand_core::le;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,16 +13,17 @@ pub struct UserPrivateDetails {
 }
 
 pub struct PublicValues {
-    pub public_key: VerifyingKey,
+    pub public_key: (G2Projective, G2Projective),
     pub G: G1Projective,
     pub B: G1Projective,
     pub Q: G1Projective,
     pub G_vec: Vec<G1Projective>,
     pub H_vec: Vec<G1Projective>,
+    pub current_timestamp: u128,
 }
 
 pub struct IssuerPrivateValues {
-    pub private_key: SigningKey,
+    pub private_key: (Fr, Fr),
 }
 
 pub struct BulletproofProverPrivateValues {
@@ -37,7 +41,7 @@ pub struct BulletproofProverPrivateValues {
 pub struct BulletproofProverPublicValues {
     pub A: G1Projective,
     pub S: G1Projective,
-    pub V: G1Projective,
+    pub V_birthday: G1Projective,
 
     pub T_1: G1Projective,
     pub T_2: G1Projective,
@@ -55,16 +59,23 @@ pub struct BulletproofProverPublicValues {
 
 pub struct ProverPrivateValues {
     pub age_verification_proof: BulletproofProverPrivateValues,
+    pub signature: Option<(G1Projective, G1Projective)>,
+}
+
+pub struct SignatureProvingValues {
+    pub A1: G1Projective,
+    pub A2: PairingOutput<Bn254>,
+    pub s_v: Fr,
+    pub s_gamma: Fr,
 }
 
 pub struct ProverPublicValues {
     pub age_verification_proof: BulletproofProverPublicValues,
+    pub signature: (G1Projective, G1Projective),
+    pub signature_proving_values: SignatureProvingValues,
 }
 
-pub struct DigitalID {
-    pub v_birthday: G1Projective,
-    pub signature: Signature,
-}
+pub struct DigitalID {}
 
 impl UserPrivateDetails {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
@@ -72,29 +83,7 @@ impl UserPrivateDetails {
     }
 }
 
-impl DigitalID {
-    pub fn generate(
-        v_birthday: G1Projective,
-        private_key: &SigningKey,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut v_birthday_bytes = Vec::new();
-        let _ = v_birthday.serialize_compressed(&mut v_birthday_bytes);
-        Ok(DigitalID {
-            v_birthday: v_birthday,
-            signature: private_key.sign(&v_birthday_bytes),
-        })
-    }
-
-    pub fn verify_signature(&self, public_key: &VerifyingKey) {
-        let mut v_birthday_bytes = Vec::new();
-        let _ = self.v_birthday.serialize_compressed(&mut v_birthday_bytes);
-        assert!(
-            public_key
-                .verify(&v_birthday_bytes, &self.signature)
-                .is_ok()
-        );
-    }
-}
+impl DigitalID {}
 
 impl ProverPrivateValues {
     pub fn empty() -> ProverPrivateValues {
@@ -111,6 +100,7 @@ impl ProverPrivateValues {
                 t_1: None,
                 t_2: None,
             },
+            signature: None,
         }
     }
 }

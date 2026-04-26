@@ -106,7 +106,7 @@ pub fn fold_points(points: &mut Vec<G1Projective>, u: Fr) -> Vec<G1Projective> {
     foldded
 }
 
-pub fn point_to_bytes(p: &G1Projective) -> Vec<u8> {
+pub fn point_to_bytes<G: CanonicalSerialize>(p: &G) -> Vec<u8> {
     let mut buf = Vec::new();
     p.serialize_compressed(&mut buf).unwrap();
     buf

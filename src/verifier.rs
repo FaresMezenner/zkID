@@ -1,4 +1,5 @@
-use ark_bn254::{Fr, G1Projective};
+use ark_bn254::{Bn254, Fr, G1Projective, G2Projective};
+use ark_ec::{PrimeGroup, pairing::Pairing};
 use ark_ff::Field;
 
 use crate::{
@@ -7,15 +8,16 @@ use crate::{
 };
 
 pub fn calculate_v_age(
-    digital_id: &DigitalID,
     age_threshold: u128,
     n_bits: u128,
-    current_timestamp: u128,
     public_values: &PublicValues,
+    prover_public_values: &ProverPublicValues,
 ) -> G1Projective {
-    digital_id.v_birthday
+    prover_public_values.age_verification_proof.V_birthday
         + public_values.G
-            * Fr::from((age_threshold + ((1 << n_bits) - 1) - current_timestamp) as u128)
+            * Fr::from(
+                (age_threshold + ((1 << n_bits) - 1) - public_values.current_timestamp) as u128,
+            )
 }
 
 pub fn verify_bulletproof(
@@ -102,24 +104,41 @@ pub fn verify_bulletproof(
     )
 }
 
+fn verify_signature(public_values: &PublicValues, prover_public_values: &ProverPublicValues) {
+    let c = fiat_shamir_challenge(&[
+        &point_to_bytes(&prover_public_values.age_verification_proof.V_birthday),
+        &point_to_bytes(&prover_public_values.signature.0),
+        &point_to_bytes(&prover_public_values.signature.1),
+        &point_to_bytes(&prover_public_values.signature_proving_values.A1),
+        &point_to_bytes(&prover_public_values.signature_proving_values.A2),
+    ]);
+    let e_sigma1_pk2 = Bn254::pairing(prover_public_values.signature.0, public_values.public_key.1);
+    let e_sigma2_g2 = Bn254::pairing(prover_public_values.signature.1, G2Projective::generator());
+    let e_sigma1_pk1 = Bn254::pairing(prover_public_values.signature.0, public_values.public_key.0);
+
+    assert_eq!(
+        e_sigma1_pk2 * prover_public_values.signature_proving_values.s_v
+            + (e_sigma2_g2 - e_sigma1_pk1) * c,
+        prover_public_values.signature_proving_values.A2
+    );
+    assert_eq!(
+        public_values.G * prover_public_values.signature_proving_values.s_v
+            + public_values.B * prover_public_values.signature_proving_values.s_gamma
+            + prover_public_values.age_verification_proof.V_birthday * c,
+        prover_public_values.signature_proving_values.A1
+    )
+}
+
 pub fn verify_id(
-    digital_id: &DigitalID,
     age_threshold: u128,
     n_bits: u128,
-    current_timestamp: u128,
     public_values: &PublicValues,
     prover_public_values: &ProverPublicValues,
 ) {
     // the verifier must verify the id first
-    digital_id.verify_signature(&public_values.public_key);
+    verify_signature(public_values, prover_public_values);
 
-    let V_age = calculate_v_age(
-        digital_id,
-        age_threshold,
-        n_bits,
-        current_timestamp,
-        public_values,
-    );
+    let V_age = calculate_v_age(age_threshold, n_bits, public_values, prover_public_values);
     verify_bulletproof(
         &prover_public_values.age_verification_proof,
         public_values,

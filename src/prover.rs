@@ -1,5 +1,7 @@
+use ark_bn254::Bn254;
 use ark_bn254::{Fr, G1Projective};
 use ark_ec::AdditiveGroup;
+use ark_ec::pairing::Pairing;
 use ark_ff::BigInteger;
 use ark_ff::Field;
 use ark_ff::PrimeField;
@@ -13,6 +15,8 @@ use crate::core::{
     commit, commit_fr, compute_secondary_diagonals, fiat_shamir_challenge, fold_points,
     fold_values, inner_product_fr, powers_vec, to_bits_le,
 };
+use crate::data;
+use crate::data::SignatureProvingValues;
 use crate::data::{
     BulletproofProverPublicValues, ProverPrivateValues, ProverPublicValues, PublicValues,
     UserPrivateDetails,
@@ -41,6 +45,7 @@ pub fn calculate_a_s_v(
 
     prover_private_values.age_verification_proof.alpha = Some(Fr::rand(&mut rng));
     prover_private_values.age_verification_proof.beta = Some(Fr::rand(&mut rng));
+    prover_private_values.age_verification_proof.gamma = Some(Fr::rand(&mut rng));
 
     let A = commit(&aR, &public_values.H_vec).unwrap()
         + commit(&aL, &public_values.G_vec).unwrap()
@@ -113,23 +118,20 @@ pub fn calculate_proofs_values(
     public_values: &PublicValues,
     prover_private_values: &mut ProverPrivateValues,
     n_bits: u128,
-    current_timestamp: u128,
     user_private_details: &mut UserPrivateDetails,
-) -> BulletproofProverPublicValues {
+) -> (BulletproofProverPublicValues) {
     let mut rng = rand::thread_rng();
-    let v_age: u128 = age_threshold + ((1u128 << n_bits) - 1) - current_timestamp
+    let v_age: u128 = age_threshold + ((1u128 << n_bits) - 1) - public_values.current_timestamp
         + (user_private_details.birthday.timestamp_millis() as u128);
 
-    let (A_age, S_age, V_age_prover) =
-        prover::calculate_a_s_v(v_age, &public_values, prover_private_values, n_bits);
+    let (A, S, _) = prover::calculate_a_s_v(v_age, &public_values, prover_private_values, n_bits);
+    let V_birthday = public_values.G
+        * Fr::from(user_private_details.birthday.timestamp_millis() as i128)
+        + public_values.B * prover_private_values.age_verification_proof.gamma.unwrap();
 
     // here we calculate y and z using fiat shammir
-    let y = fiat_shamir_challenge(&[&point_to_bytes(&A_age), &point_to_bytes(&S_age)]);
-    let z = fiat_shamir_challenge(&[
-        &point_to_bytes(&A_age),
-        &point_to_bytes(&S_age),
-        &fr_to_bytes(&y),
-    ]);
+    let y = fiat_shamir_challenge(&[&point_to_bytes(&A), &point_to_bytes(&S)]);
+    let z = fiat_shamir_challenge(&[&point_to_bytes(&A), &point_to_bytes(&S), &fr_to_bytes(&y)]);
 
     let y_n = powers_vec(&y, &n_bits);
 
@@ -191,8 +193,8 @@ pub fn calculate_proofs_values(
 
     // u is computed using fiat-shamir over the transcript so far
     let u = fiat_shamir_challenge(&[
-        &point_to_bytes(&A_age),
-        &point_to_bytes(&S_age),
+        &point_to_bytes(&A),
+        &point_to_bytes(&S),
         &fr_to_bytes(&y),
         &fr_to_bytes(&z),
         &point_to_bytes(&T_1),
@@ -241,14 +243,14 @@ pub fn calculate_proofs_values(
         &public_values.Q,
     );
     BulletproofProverPublicValues {
-        A: A_age,
+        A,
         C: C,
-        S: S_age,
+        S,
         Ls: Ls,
         Rs: Rs,
         T_1: T_1,
         T_2: T_2,
-        V: V_age_prover,
+        V_birthday,
         l_u: l_u,
         pi_l_r: pi_l_r,
         pi_t: pi_t,
@@ -259,22 +261,69 @@ pub fn calculate_proofs_values(
     }
 }
 
+fn re_randomize_signatur(
+    current_signature: (G1Projective, G1Projective),
+) -> (G1Projective, G1Projective) {
+    let mut rng = rand::thread_rng();
+    let t = Fr::rand(&mut rng);
+    (current_signature.0 * t, current_signature.1 * t)
+}
+
+fn generate_signature_proving_values(
+    signature: (G1Projective, G1Projective),
+    public_values: &PublicValues,
+    user_private_details: &UserPrivateDetails,
+    prover_private_values: &ProverPrivateValues,
+    V_birthday: &G1Projective,
+) -> SignatureProvingValues {
+    let mut rng = rand::thread_rng();
+    let r_v = Fr::rand(&mut rng);
+    let r_gamma = Fr::rand(&mut rng);
+    let A1 = public_values.G * r_v + public_values.B * r_gamma;
+    let A2 = Bn254::pairing(signature.0, public_values.public_key.1) * r_v;
+    let c = fiat_shamir_challenge(&[
+        &point_to_bytes(V_birthday),
+        &point_to_bytes(&signature.0),
+        &point_to_bytes(&signature.1),
+        &point_to_bytes(&A1),
+        &point_to_bytes(&A2),
+    ]);
+    let s_v = r_v - c * Fr::from(user_private_details.birthday.timestamp_millis() as i128);
+    let s_gamma = r_gamma - c * prover_private_values.age_verification_proof.gamma.unwrap();
+
+    SignatureProvingValues {
+        A1,
+        A2,
+        s_gamma,
+        s_v,
+    }
+}
+
 pub fn calculate_values(
     age_threshold: u128,
     public_values: &PublicValues,
     prover_private_values: &mut ProverPrivateValues,
     n_bits: u128,
-    current_timestamp: u128,
     user_private_details: &mut UserPrivateDetails,
 ) -> ProverPublicValues {
+    let age_verification_proof = calculate_proofs_values(
+        age_threshold,
+        public_values,
+        prover_private_values,
+        n_bits,
+        user_private_details,
+    );
+    let new_signature = re_randomize_signatur(prover_private_values.signature.unwrap());
+
     ProverPublicValues {
-        age_verification_proof: calculate_proofs_values(
-            age_threshold,
+        signature_proving_values: generate_signature_proving_values(
+            new_signature,
             public_values,
-            prover_private_values,
-            n_bits,
-            current_timestamp,
             user_private_details,
+            prover_private_values,
+            &age_verification_proof.V_birthday,
         ),
+        age_verification_proof,
+        signature: new_signature,
     }
 }
