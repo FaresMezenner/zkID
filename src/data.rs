@@ -5,6 +5,7 @@ use ark_serialize::CanonicalSerialize;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use elliptic_curve::rand_core::le;
+use num_bigint::{BigInt, BigUint};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,17 +14,22 @@ pub struct UserPrivateDetails {
 }
 
 pub struct PublicValues {
-    pub public_key: (G2Projective, G2Projective),
+    pub public_key: (G2Projective, G2Projective, G2Projective),
     pub G: G1Projective,
     pub B: G1Projective,
     pub Q: G1Projective,
     pub G_vec: Vec<G1Projective>,
     pub H_vec: Vec<G1Projective>,
     pub current_timestamp: u128,
+    pub N: BigUint,
+    pub g: BigUint,
+    pub P: BigUint,
+    pub Acc: BigUint,
 }
 
 pub struct IssuerPrivateValues {
-    pub private_key: (Fr, Fr),
+    pub private_key: (Fr, Fr, Fr),
+    pub revocation_key: BigUint,
 }
 
 pub struct BulletproofProverPrivateValues {
@@ -60,6 +66,8 @@ pub struct BulletproofProverPublicValues {
 pub struct ProverPrivateValues {
     pub age_verification_proof: BulletproofProverPrivateValues,
     pub signature: Option<(G1Projective, G1Projective)>,
+    pub unique_id: Option<BigUint>,
+    pub rev_id: Option<BigUint>,
 }
 
 pub struct SignatureProvingValues {
@@ -67,12 +75,21 @@ pub struct SignatureProvingValues {
     pub A2: PairingOutput<Bn254>,
     pub s_v: Fr,
     pub s_gamma: Fr,
+    pub s_rev: BigInt,
+}
+
+pub struct NonMembershipProvingValues {
+    pub T: BigUint,
+    pub K: BigUint,
+    pub a_prime: BigInt,
+    pub b_prime: BigInt,
 }
 
 pub struct ProverPublicValues {
     pub age_verification_proof: BulletproofProverPublicValues,
     pub signature: (G1Projective, G1Projective),
     pub signature_proving_values: SignatureProvingValues,
+    pub revocation_non_membership_proof: NonMembershipProvingValues,
 }
 
 pub struct DigitalID {}
@@ -101,6 +118,8 @@ impl ProverPrivateValues {
                 t_2: None,
             },
             signature: None,
+            rev_id: None,
+            unique_id: None,
         }
     }
 }

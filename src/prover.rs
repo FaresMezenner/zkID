@@ -1,21 +1,17 @@
 use ark_bn254::Bn254;
 use ark_bn254::{Fr, G1Projective};
-use ark_ec::AdditiveGroup;
 use ark_ec::pairing::Pairing;
-use ark_ff::BigInteger;
 use ark_ff::Field;
-use ark_ff::PrimeField;
-use ark_serialize::CanonicalSerialize;
 use ark_std::UniformRand;
+use num_bigint::{BigInt, BigUint, RandBigInt, Sign};
 use rand::Rng;
 
-use crate::core::fr_to_bytes;
-use crate::core::point_to_bytes;
 use crate::core::{
-    commit, commit_fr, compute_secondary_diagonals, fiat_shamir_challenge, fold_points,
-    fold_values, inner_product_fr, powers_vec, to_bits_le,
+    bezout_coefficients, commit, commit_fr, compute_secondary_diagonals, fiat_shamir_challenge,
+    fiat_shamir_challenge_biguint, fold_points, fold_values, fr_from_biguint_z, fr_to_bytes,
+    inner_product_fr, mod_pow_z_n_signed, point_to_bytes, powers_vec, to_bits_le,
 };
-use crate::data;
+use crate::data::NonMembershipProvingValues;
 use crate::data::SignatureProvingValues;
 use crate::data::{
     BulletproofProverPublicValues, ProverPrivateValues, ProverPublicValues, PublicValues,
@@ -119,7 +115,7 @@ pub fn calculate_proofs_values(
     prover_private_values: &mut ProverPrivateValues,
     n_bits: u128,
     user_private_details: &mut UserPrivateDetails,
-) -> (BulletproofProverPublicValues) {
+) -> BulletproofProverPublicValues {
     let mut rng = rand::thread_rng();
     let v_age: u128 = age_threshold + ((1u128 << n_bits) - 1) - public_values.current_timestamp
         + (user_private_details.birthday.timestamp_millis() as u128);
@@ -275,27 +271,76 @@ fn generate_signature_proving_values(
     user_private_details: &UserPrivateDetails,
     prover_private_values: &ProverPrivateValues,
     V_birthday: &G1Projective,
+    non_membership_proof: &NonMembershipProvingValues,
+    r_rev_z: &BigUint,
 ) -> SignatureProvingValues {
     let mut rng = rand::thread_rng();
-    let r_v = Fr::rand(&mut rng);
-    let r_gamma = Fr::rand(&mut rng);
-    let A1 = public_values.G * r_v + public_values.B * r_gamma;
-    let A2 = Bn254::pairing(signature.0, public_values.public_key.1) * r_v;
-    let c = fiat_shamir_challenge(&[
+    let r_v_fr = Fr::rand(&mut rng);
+    let r_gamma_fr = Fr::rand(&mut rng);
+    let r_rev_fr = fr_from_biguint_z(r_rev_z);
+
+    let A1 = public_values.G * r_v_fr + public_values.B * r_gamma_fr;
+    let A2 = (Bn254::pairing(signature.0, public_values.public_key.1) * r_v_fr)
+        + (Bn254::pairing(signature.0, public_values.public_key.2) * r_rev_fr);
+    let c_z = fiat_shamir_challenge_biguint(&[
+        &public_values.N.to_bytes_le(),
+        &public_values.g.to_bytes_le(),
+        &public_values.Acc.to_bytes_le(),
+        &public_values.P.to_bytes_le(),
+        &point_to_bytes(&public_values.public_key.0),
+        &point_to_bytes(&public_values.public_key.1),
+        &point_to_bytes(&public_values.public_key.2),
         &point_to_bytes(V_birthday),
         &point_to_bytes(&signature.0),
         &point_to_bytes(&signature.1),
         &point_to_bytes(&A1),
         &point_to_bytes(&A2),
+        non_membership_proof.K.to_bytes_le().as_slice(),
+        non_membership_proof.T.to_bytes_le().as_slice(),
     ]);
-    let s_v = r_v - c * Fr::from(user_private_details.birthday.timestamp_millis() as i128);
-    let s_gamma = r_gamma - c * prover_private_values.age_verification_proof.gamma.unwrap();
+    let c_fr = fr_from_biguint_z(&c_z);
+    let rev_id_z = prover_private_values
+        .rev_id
+        .as_ref()
+        .expect("revocation ID must be available before proving");
+
+    let s_v = r_v_fr - c_fr * Fr::from(user_private_details.birthday.timestamp_millis() as i128);
+    let s_gamma = r_gamma_fr - c_fr * prover_private_values.age_verification_proof.gamma.unwrap();
+    let s_rev = BigInt::from_biguint(Sign::Plus, r_rev_z.clone())
+        - BigInt::from_biguint(Sign::Plus, c_z)
+            * BigInt::from_biguint(Sign::Plus, rev_id_z.clone());
 
     SignatureProvingValues {
         A1,
         A2,
         s_gamma,
         s_v,
+        s_rev,
+    }
+}
+
+fn generate_non_membership_proving_values(
+    public_values: &PublicValues,
+    rev_id_z: &BigUint,
+    r_rev_z: &BigUint,
+) -> NonMembershipProvingValues {
+    let mut rng = rand::thread_rng();
+    let k_z = rng.gen_biguint(256);
+    let K = public_values.g.modpow(&k_z, &public_values.N);
+    let (a_z, b_z) = bezout_coefficients(rev_id_z, &public_values.P);
+    let k_bigint_z = BigInt::from_biguint(Sign::Plus, k_z);
+    let a_prime = &k_bigint_z * a_z;
+    let b_prime = &k_bigint_z * b_z;
+
+    let r_rev_bigint_z = BigInt::from_biguint(Sign::Plus, r_rev_z.clone());
+    let t_exponent_z = &r_rev_bigint_z * &a_prime;
+    let T = mod_pow_z_n_signed(&public_values.g, &t_exponent_z, &public_values.N);
+
+    NonMembershipProvingValues {
+        T,
+        K,
+        a_prime,
+        b_prime,
     }
 }
 
@@ -313,6 +358,17 @@ pub fn calculate_values(
         n_bits,
         user_private_details,
     );
+
+    let rev_id_z = prover_private_values
+        .rev_id
+        .as_ref()
+        .expect("revocation ID must be set by issuer before proving");
+    let mut rng = rand::thread_rng();
+    let r_rev_z = rng.gen_biguint(256);
+
+    let non_membership_proof =
+        generate_non_membership_proving_values(public_values, rev_id_z, &r_rev_z);
+
     let new_signature = re_randomize_signatur(prover_private_values.signature.unwrap());
 
     ProverPublicValues {
@@ -322,8 +378,11 @@ pub fn calculate_values(
             user_private_details,
             prover_private_values,
             &age_verification_proof.V_birthday,
+            &non_membership_proof,
+            &r_rev_z,
         ),
         age_verification_proof,
         signature: new_signature,
+        revocation_non_membership_proof: non_membership_proof,
     }
 }
