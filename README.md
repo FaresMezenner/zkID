@@ -2,6 +2,10 @@
 
 This project aims to build Privacy-Preserving Age Verification using privacy preserving techniques and algorithms, trying to match as much as possible the requirements as explained in the [attached document](./project-private-auth.pdf)
 
+IMPORTANT NOTES:
+- AI usage was minimal in this project, it was used either as documentation source or debugging tool, not a thinking brain.
+- The point of this project is to learn and implement, from scratch, a ZK system using different existing systems, so if the code looks bad, it is intential, as I was focusing on building a PoC and not a project that reflect my coding skills (which are good even without AI)
+
 ## Iteration 1
 
 In this iteration we will focus on building the ID with one feature of the many mentioned features in mind: how can the prover prove that their above the threshold age without revealing any unwanted information?
